@@ -30,6 +30,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.OperationApplicationException;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.res.AssetManager;
+import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.database.Cursor;
 import android.database.SQLException;
@@ -40,8 +43,10 @@ import android.database.sqlite.SQLiteStatement;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
+import android.os.SystemProperties;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.SparseArray;
 
@@ -56,12 +61,13 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Set;
 
 public class LauncherProvider extends ContentProvider {
     private static final String TAG = "Launcher.LauncherProvider";
     private static final boolean LOGD = false;
 
-    private static final int DATABASE_VERSION = 21;
+    private static final int DATABASE_VERSION = 22;
 
     static final String OLD_AUTHORITY = "com.android.launcher2.settings";
     static final String AUTHORITY = ProviderConfig.AUTHORITY;
@@ -88,6 +94,8 @@ public class LauncherProvider extends ContentProvider {
      */
     static final Uri CONTENT_APPWIDGET_RESET_URI =
             Uri.parse("content://" + AUTHORITY + "/appWidgetReset");
+
+    private static final String MCC_PROP_NAME = "ro.prebundled.mcc";
 
     private DatabaseHelper mOpenHelper;
     private static boolean sJustLoadedFromOldDb;
@@ -310,10 +318,56 @@ public class LauncherProvider extends ContentProvider {
         SharedPreferences sp = getContext().getSharedPreferences(spKey, Context.MODE_PRIVATE);
 
         if (sp.getBoolean(EMPTY_DATABASE_CREATED, false)) {
-            Log.d(TAG, "loading default workspace");
+            if (LOGD) Log.d(TAG, "loading default workspace");
 
             AutoInstallsLayout loader = AutoInstallsLayout.get(getContext(),
                     mOpenHelper.mAppWidgetHost, mOpenHelper);
+
+            String mcc = SystemProperties.get(MCC_PROP_NAME);
+
+            if (!TextUtils.isEmpty(mcc)) {
+                if (LOGD) Log.d(TAG, "mcc: " + mcc);
+
+                Configuration tempConfiguration = new Configuration(getContext().getResources().
+                        getConfiguration());
+                boolean shouldUseTempConfig = false;
+
+                try {
+                    tempConfiguration.mcc = Integer.parseInt(mcc);
+                    shouldUseTempConfig = true;
+                } catch (NumberFormatException e) {
+                    // not able to parse mcc, catch exception and exit out of this logic
+                    e.printStackTrace();
+                }
+
+                if (shouldUseTempConfig) {
+                    String publicSrcDir = null;
+                    try {
+                        String packageName = getContext().getPackageName();
+                        publicSrcDir = getContext().getPackageManager().
+                                getApplicationInfo(packageName, 0).publicSourceDir;
+                    } catch (PackageManager.NameNotFoundException e) {
+                        e.printStackTrace();
+                    }
+
+                    AssetManager assetManager = new AssetManager();
+                    if (!TextUtils.isEmpty(publicSrcDir)) {
+                        assetManager.addAssetPath(publicSrcDir);
+                    }
+                    Resources customResources = new Resources(assetManager, new DisplayMetrics(),
+                            tempConfiguration);
+
+                    int mccLayout = LauncherAppState.getInstance()
+                            .getDynamicGrid().getDeviceProfile().defaultLayoutId;
+
+                    if (mccLayout != 0) {
+                        if (LOGD) Log.d(TAG, "mcc layout id: " + mccLayout);
+
+                        loader = new DefaultLayoutParser(getContext(), mOpenHelper.mAppWidgetHost,
+                                mOpenHelper, customResources, mccLayout);
+                    }
+                }
+            }
 
             if (loader == null) {
                 final Partner partner = Partner.get(getContext().getPackageManager());
@@ -936,6 +990,11 @@ public class LauncherProvider extends ContentProvider {
                 version = 21;
             }
 
+            if (oldVersion < 22) {
+                updateDialtactsLauncher(db);
+                version = 22;
+            }
+
             if (version != DATABASE_VERSION) {
                 Log.w(TAG, "Destroying all old data.");
                 db.execSQL("DROP TABLE IF EXISTS " + TABLE_FAVORITES);
@@ -984,6 +1043,74 @@ public class LauncherProvider extends ContentProvider {
                 db.endTransaction();
             }
             return true;
+        }
+
+        private void updateDialtactsLauncher(SQLiteDatabase db) {
+            if (!Utilities.isPackageInstalled(mContext, "com.cyngn.dialer")) {
+                return;
+            }
+
+            final String cyngnDialer = "com.cyngn.dialer";
+            final String aospDialer = "com.android.dialer";
+            final String dialtactsClass = "com.android.dialer.DialtactsActivity";
+
+            final String selectWhere = buildOrWhereString(Favorites.ITEM_TYPE,
+                    new int[]{Favorites.ITEM_TYPE_SHORTCUT, Favorites.ITEM_TYPE_APPLICATION});
+            Cursor c = null;
+            db.beginTransaction();
+
+            try {
+                // Select and iterate through each matching widget
+                c = db.query(TABLE_FAVORITES,
+                        new String[] { Favorites._ID, Favorites.INTENT },
+                        selectWhere, null, null, null, null);
+                if (c == null) return;
+
+                while (c.moveToNext()) {
+                    long favoriteId = c.getLong(0);
+                    final String intentUri = c.getString(1);
+                    if (intentUri != null) {
+                        try {
+                            final Intent intent = Intent.parseUri(intentUri, 0);
+                            final ComponentName componentName = intent.getComponent();
+                            final Set<String> categories = intent.getCategories();
+
+                            if (Intent.ACTION_MAIN.equals(intent.getAction()) &&
+                                    componentName != null &&
+                                    aospDialer.equals(componentName.getPackageName()) &&
+                                    dialtactsClass.equals(componentName.getClassName()) &&
+                                    categories != null &&
+                                    categories.contains(Intent.CATEGORY_LAUNCHER)) {
+
+                                final ComponentName newName = new ComponentName(cyngnDialer,
+                                        componentName.getClassName());
+                                intent.setComponent(newName);
+                                final ContentValues values = new ContentValues();
+                                values.put(Favorites.INTENT, intent.toUri(0));
+
+                                String updateWhere = Favorites._ID + "=" + favoriteId;
+                                db.update(TABLE_FAVORITES, values, updateWhere, null);
+                                if (LOGD) {
+                                    Log.i(TAG, "Updated " + componentName + " to " + newName);
+                                }
+                            }
+                        } catch (RuntimeException ex) {
+                            Log.e(TAG, "Problem moving Dialtacts activity", ex);
+                        } catch (URISyntaxException e) {
+                            Log.e(TAG, "Problem moving Dialtacts activity", e);
+                        }
+                    }
+                }
+
+                db.setTransactionSuccessful();
+            } catch (SQLException ex) {
+                Log.w(TAG, "Problem while upgrading dialtacts icon", ex);
+            } finally {
+                db.endTransaction();
+                if (c != null) {
+                    c.close();
+                }
+            }
         }
 
         private boolean updateContactsShortcuts(SQLiteDatabase db) {
